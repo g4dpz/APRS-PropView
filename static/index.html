@@ -101,7 +101,7 @@
                     <span class="wx-temp" id="wx-temp">--°F</span>
                     <span class="wx-desc" id="wx-desc">--</span>
                     <span class="wx-details">
-                        <span title="Feels like">🌡️ <span id="wx-feels">--</span>°F</span>
+                        <span title="Feels like">🌡️ <span id="wx-feels">--</span><span class="wx-unit-suffix">°F</span></span>
                         <span title="Wind">💨 <span id="wx-wind">--</span></span>
                         <span title="Humidity">💧 <span id="wx-humidity">--</span>%</span>
                         <span title="Pressure">📊 <span id="wx-pressure">--</span> mb</span>
@@ -792,9 +792,25 @@
                             <input type="checkbox" id="cfg-wx-enabled">
                         </div>
                         <div class="settings-row">
+                            <label for="cfg-wx-region">Region</label>
+                            <select id="cfg-wx-region">
+                                <option value="auto">Auto</option>
+                                <option value="US">US</option>
+                                <option value="UK">UK</option>
+                                <option value="EU">EU</option>
+                            </select>
+                        </div>
+                        <div class="settings-row">
+                            <label for="cfg-wx-units">Units</label>
+                            <select id="cfg-wx-units">
+                                <option value="imperial">Imperial</option>
+                                <option value="metric">Metric</option>
+                            </select>
+                        </div>
+                        <div class="settings-row">
                             <label for="cfg-wx-location">Location Code</label>
                             <div class="wx-location-input">
-                                <input type="text" id="cfg-wx-location" placeholder="US Zip (28801) or ICAO (KAVL)" maxlength="5">
+                                <input type="text" id="cfg-wx-location" placeholder="US Zip (28801) or ICAO (KAVL)" maxlength="80">
                                 <button id="btn-wx-resolve" class="btn-small" title="Look up location">🔍 Lookup</button>
                             </div>
                         </div>

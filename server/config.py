@@ -111,6 +111,8 @@ regional_full_dist_km = 200.0
 [weather]
 enabled = false
 location_code = ""
+region = "auto"
+units = "imperial"
 alert_range_miles = 50
 refresh_minutes = 15
 radar_enabled = false
@@ -259,6 +261,8 @@ class PropagationConfig:
 class WeatherConfig:
     enabled: bool = False
     location_code: str = ""       # US zip code or ICAO code
+    region: str = "auto"           # "auto", "US", "UK", or "EU"
+    units: str = "imperial"        # "imperial" or "metric"
     alert_range_miles: int = 50    # Range for severe weather alerts
     refresh_minutes: int = 15      # How often to refresh weather data
     radar_enabled: bool = False
@@ -449,6 +453,8 @@ class Config:
             "[weather]",
             f"enabled = {'true' if self.weather.enabled else 'false'}",
             f'location_code = "{esc(self.weather.location_code)}"',
+            f'region = "{esc(self.weather.region)}"',
+            f'units = "{esc(self.weather.units)}"',
             f"alert_range_miles = {int(self.weather.alert_range_miles)}",
             f"refresh_minutes = {int(self.weather.refresh_minutes)}",
             f"radar_enabled = {'true' if self.weather.radar_enabled else 'false'}",

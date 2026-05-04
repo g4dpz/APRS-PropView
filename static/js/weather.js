@@ -75,14 +75,48 @@ window.pvWeather = (function () {
 
         const wx = data.current;
 
+        // Adapt UI labels when region is present in the response
+        if (data.region) {
+            updateRegionLabels(data.region);
+        }
+
+        // Resolve unit labels — fall back to hardcoded imperial if absent
+        const labels = data.unit_labels || wx.unit_labels || {
+            temperature: '°F',
+            wind_speed: 'mph',
+            precipitation: 'in',
+            distance: 'miles',
+        };
+
         // Show current weather banner
         if (banner) banner.style.display = 'flex';
 
         setText('wx-icon', wx.icon || '❓');
-        setText('wx-temp', wx.temperature_f != null ? Math.round(wx.temperature_f) + '°F' : '--°F');
+
+        // Temperature: use the field matching the active unit system
+        const temp = labels.temperature === '°C'
+            ? (wx.temperature_c != null ? wx.temperature_c : wx.temperature_f)
+            : (wx.temperature_f != null ? wx.temperature_f : wx.temperature_c);
+        setText('wx-temp', temp != null ? Math.round(temp) + labels.temperature : '--' + labels.temperature);
+
         setText('wx-desc', wx.description || '--');
-        setText('wx-feels', wx.feels_like_f != null ? Math.round(wx.feels_like_f) : '--');
-        setText('wx-wind', formatWind(wx));
+
+        // Feels like: use the field matching the active unit system
+        const feels = labels.temperature === '°C'
+            ? (wx.feels_like_c != null ? wx.feels_like_c : wx.feels_like_f)
+            : (wx.feels_like_f != null ? wx.feels_like_f : wx.feels_like_c);
+        setText('wx-feels', feels != null ? Math.round(feels) : '--');
+
+        // Update the feels-like suffix in the banner
+        const feelsSpan = document.getElementById('wx-feels');
+        if (feelsSpan && feelsSpan.parentElement) {
+            const suffix = feelsSpan.parentElement.querySelector('.wx-unit-suffix');
+            if (suffix) {
+                suffix.textContent = labels.temperature;
+            }
+        }
+
+        setText('wx-wind', formatWind(wx, labels));
         setText('wx-humidity', wx.humidity != null ? Math.round(wx.humidity) : '--');
         setText('wx-pressure', wx.pressure_mb != null ? Math.round(wx.pressure_mb) : '--');
         setText('wx-location', wx.location_name || wx.location_code || '--');
@@ -121,12 +155,20 @@ window.pvWeather = (function () {
         map.updateWeatherAlerts(data?.alerts || []);
     }
 
-    function formatWind(wx) {
-        if (wx.wind_speed_mph == null) return '--';
-        let wind = `${Math.round(wx.wind_speed_mph)} mph`;
+    function formatWind(wx, labels) {
+        const windLabel = (labels && labels.wind_speed) || 'mph';
+        // Use the field matching the active unit system
+        const speed = windLabel === 'km/h'
+            ? (wx.wind_speed_kmh != null ? wx.wind_speed_kmh : wx.wind_speed_mph)
+            : (wx.wind_speed_mph != null ? wx.wind_speed_mph : wx.wind_speed_kmh);
+        if (speed == null) return '--';
+        let wind = `${Math.round(speed)} ${windLabel}`;
         if (wx.wind_direction_label) wind += ` ${wx.wind_direction_label}`;
-        if (wx.wind_gusts_mph && wx.wind_gusts_mph > wx.wind_speed_mph + 5) {
-            wind += ` (G${Math.round(wx.wind_gusts_mph)})`;
+        const gusts = windLabel === 'km/h'
+            ? (wx.wind_gusts_kmh != null ? wx.wind_gusts_kmh : wx.wind_gusts_mph)
+            : (wx.wind_gusts_mph != null ? wx.wind_gusts_mph : wx.wind_gusts_kmh);
+        if (gusts != null && gusts > speed + 5) {
+            wind += ` (G${Math.round(gusts)})`;
         }
         return wind;
     }
@@ -315,6 +357,39 @@ window.pvWeather = (function () {
         div.textContent = str || '';
         return div.innerHTML;
     }
+
+    // ── Region-aware label updates ───────────────────────────
+
+    /**
+     * Update UI labels based on the detected region.
+     * US/unset: location input placeholder references US ZIP and ICAO.
+     * UK/EU: placeholder references UK postcodes, ICAO, and place names.
+     * Also updates the alert overlay checkbox label.
+     */
+    function updateRegionLabels(region) {
+        const locationInput = document.getElementById('cfg-wx-location');
+        const alertOverlayLabel = document.querySelector('label[for="cfg-wx-alert-overlay-enabled"]');
+
+        if (region === 'UK' || region === 'EU') {
+            if (locationInput) {
+                locationInput.placeholder = 'UK Postcode, ICAO, or Place Name';
+            }
+            if (alertOverlayLabel) {
+                alertOverlayLabel.textContent = 'Show Weather Alert Polygons';
+            }
+        } else {
+            // US or unset — default labels
+            if (locationInput) {
+                locationInput.placeholder = 'US Zip (28801) or ICAO (KAVL)';
+            }
+            if (alertOverlayLabel) {
+                alertOverlayLabel.textContent = 'Show NWS Alert Polygons';
+            }
+        }
+    }
+
+    // Expose globally for external callers
+    window.updateRegionLabels = updateRegionLabels;
 
     return {
         init,

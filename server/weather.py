@@ -1,9 +1,11 @@
 """Weather data provider using Open-Meteo (current conditions) and NWS (alerts).
 
 All APIs used are free and require no API key:
-  - Open-Meteo: https://open-meteo.com/
-  - NWS:        https://api.weather.gov/
-  - Zippopotam: http://api.zippopotam.us/  (zip → lat/lon)
+  - Open-Meteo:    https://open-meteo.com/
+  - NWS:           https://api.weather.gov/
+  - Zippopotam:    http://api.zippopotam.us/  (zip → lat/lon)
+  - Postcodes.io:  https://api.postcodes.io/  (UK postcode → lat/lon)
+  - Nominatim:     https://nominatim.openstreetmap.org/  (free-text → lat/lon)
 """
 
 import asyncio
@@ -17,6 +19,9 @@ import urllib.error
 from typing import Optional, Dict, Any, List, Tuple
 
 from server.config import Config
+from server.region import get_effective_region
+from server.units import get_unit_system, open_meteo_unit_params, format_weather_response, UnitSystem
+from server.alert_providers import get_alert_provider
 
 logger = logging.getLogger("propview.weather")
 
@@ -62,10 +67,16 @@ NWS_SEVERITY = {
     "Unknown":  "watch",
 }
 
+# UK postcode regex — all standard formats, case-insensitive, optional space
+# Formats: A9 9AA, A99 9AA, A9A 9AA, AA9 9AA, AA99 9AA, AA9A 9AA
+_UK_POSTCODE_RE = re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$", re.IGNORECASE)
 # US Zip code regex
 _ZIP_RE = re.compile(r"^\d{5}$")
 # ICAO code regex (4 uppercase letters)
 _ICAO_RE = re.compile(r"^[A-Z]{4}$")
+
+# Nominatim rate-limiting: track last request timestamp (module-level)
+_nominatim_last_request: float = 0.0
 
 
 def _classify_alert_categories(event: str, alert_type: str) -> List[str]:
@@ -143,33 +154,132 @@ async def _resolve_zip(zip_code: str) -> Optional[Tuple[float, float, str]]:
     return lat, lon, name.strip(", ")
 
 
-async def _resolve_icao(icao: str) -> Optional[Tuple[float, float, str]]:
-    """Resolve an ICAO airport code → (lat, lon, station_name) via NWS."""
+async def _resolve_uk_postcode(postcode: str) -> Optional[Tuple[float, float, str]]:
+    """Resolve a UK postcode → (lat, lon, place_name) via Postcodes.io."""
+    # Normalize: strip spaces and uppercase for the API call
+    normalized = postcode.replace(" ", "").upper()
     data = await _async_http_get(
-        f"https://api.weather.gov/stations/{icao.upper()}"
+        f"https://api.postcodes.io/postcodes/{normalized}"
     )
-    if not data or "geometry" not in data:
+    if not data or data.get("status") != 200:
         return None
-    coords = data["geometry"].get("coordinates", [])
-    if len(coords) < 2:
+    result = data.get("result")
+    if not result:
         return None
-    lon, lat = coords[0], coords[1]
-    name = data.get("properties", {}).get("name", icao.upper())
-    return lat, lon, name
+    lat = result.get("latitude")
+    lon = result.get("longitude")
+    if lat is None or lon is None:
+        return None
+    # Build a readable place name from available fields
+    parts = [
+        result.get("parish") or result.get("admin_ward") or "",
+        result.get("admin_district") or "",
+    ]
+    name = ", ".join(p for p in parts if p) or normalized
+    return float(lat), float(lon), name
+
+
+async def _resolve_nominatim(query: str) -> Optional[Tuple[float, float, str]]:
+    """Resolve a free-text query → (lat, lon, place_name) via Nominatim.
+
+    Enforces a 1-second minimum interval between requests and includes
+    a descriptive User-Agent header per Nominatim usage policy.
+    """
+    global _nominatim_last_request
+
+    # Rate limiting: wait if less than 1 second since last request
+    now = time.time()
+    elapsed = now - _nominatim_last_request
+    if elapsed < 1.0:
+        await asyncio.sleep(1.0 - elapsed)
+
+    encoded_query = urllib.request.quote(query)
+    url = (
+        f"https://nominatim.openstreetmap.org/search"
+        f"?q={encoded_query}&format=json&limit=1"
+    )
+
+    # Build a custom request with the required User-Agent
+    def _nominatim_get() -> Optional[list]:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "APRSPropView/1.0",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                json.JSONDecodeError, OSError, TimeoutError) as e:
+            logger.warning(f"Nominatim request failed for '{query}': {e}")
+            return None
+
+    loop = asyncio.get_running_loop()
+    _nominatim_last_request = time.time()
+    results = await loop.run_in_executor(None, _nominatim_get)
+
+    if not results or len(results) == 0:
+        return None
+
+    hit = results[0]
+    lat = float(hit.get("lat", 0))
+    lon = float(hit.get("lon", 0))
+    display_name = hit.get("display_name", query)
+
+    # Truncate long display names: 77 chars + "..." if over 80
+    if len(display_name) > 80:
+        display_name = display_name[:77] + "..."
+
+    return lat, lon, display_name
+
+
+async def _resolve_icao(icao: str) -> Optional[Tuple[float, float, str]]:
+    """Resolve an ICAO airport code → (lat, lon, station_name).
+
+    Tries the NWS stations API first (good coverage for US stations),
+    then falls back to Nominatim with "{ICAO} airport" for non-US codes.
+    """
+    icao = icao.upper()
+    data = await _async_http_get(
+        f"https://api.weather.gov/stations/{icao}"
+    )
+    if data and "geometry" in data:
+        coords = data["geometry"].get("coordinates", [])
+        if len(coords) >= 2:
+            lon, lat = coords[0], coords[1]
+            name = data.get("properties", {}).get("name", icao)
+            return lat, lon, name
+
+    # NWS didn't have it — fall back to Nominatim
+    return await _resolve_nominatim(f"{icao} airport")
 
 
 async def resolve_location(code: str) -> Optional[Dict[str, Any]]:
-    """Resolve a zip code or ICAO code to lat/lon/name.
+    """Resolve a location code to lat/lon/name.
+
+    Resolution priority chain (no fallthrough — if the matched resolver
+    returns None, the overall result is None):
+      1. UK postcode  (e.g. "SW1A 1AA", "M1 1AE", "ls18 5hd")
+      2. US ZIP code  (e.g. "90210")
+      3. ICAO code    (e.g. "KJFK", "EGLL") — NWS first, Nominatim fallback
+      4. Free text    (e.g. "Paris, France") — Nominatim
 
     Returns: {"latitude": float, "longitude": float, "name": str} or None.
     """
     code = code.strip()
-    if _ZIP_RE.match(code):
+    if not code:
+        return None
+
+    if _UK_POSTCODE_RE.match(code):
+        result = await _resolve_uk_postcode(code)
+    elif _ZIP_RE.match(code):
         result = await _resolve_zip(code)
     elif _ICAO_RE.match(code.upper()):
         result = await _resolve_icao(code.upper())
     else:
-        return None
+        result = await _resolve_nominatim(code)
 
     if not result:
         return None
@@ -199,11 +309,19 @@ async def resolve_alert_scope_from_point(lat: float, lon: float) -> Optional[Dic
 
 # ── Current weather from Open-Meteo ──────────────────────────────────
 
-async def fetch_current_weather(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+async def fetch_current_weather(lat: float, lon: float, unit_params: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Fetch current weather conditions from Open-Meteo.
 
     Returns a dict with temperature, humidity, wind, conditions, etc.
+    If unit_params is provided, it is used for the API request; otherwise
+    defaults to imperial units for backward compatibility.
     """
+    if unit_params is None:
+        unit_params = (
+            "&temperature_unit=fahrenheit"
+            "&wind_speed_unit=mph"
+            "&precipitation_unit=inch"
+        )
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={lat:.4f}&longitude={lon:.4f}"
@@ -211,9 +329,7 @@ async def fetch_current_weather(lat: float, lon: float) -> Optional[Dict[str, An
         f"precipitation,rain,showers,snowfall,weather_code,cloud_cover,"
         f"pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,"
         f"wind_gusts_10m,is_day"
-        f"&temperature_unit=fahrenheit"
-        f"&wind_speed_unit=mph"
-        f"&precipitation_unit=inch"
+        f"{unit_params}"
         f"&timezone=auto"
     )
     data = await _async_http_get(url)
@@ -250,75 +366,29 @@ async def fetch_current_weather(lat: float, lon: float) -> Optional[Dict[str, An
 
 # ── Tropospheric Ducting Index ───────────────────────────────────────
 
-async def fetch_ducting_data(lat: float, lon: float) -> Optional[Dict[str, Any]]:
-    """Fetch atmospheric data and compute a VHF ducting probability index.
 
-    Uses Open-Meteo pressure-level API for temperature at 850 hPa and surface,
-    plus surface humidity and pressure trends. The ducting index (0-100) estimates
-    the likelihood of tropospheric ducting conditions.
+def _compute_ducting_score(
+    surface_temp_f: Optional[float],
+    temp_850: Optional[float],
+    pressure_msl: Optional[float],
+    pressure_trend: Optional[float],
+    humidity: Optional[float],
+    wind_speed: Optional[float],
+) -> Tuple[float, Dict[str, str], bool]:
+    """Compute the ducting probability score from atmospheric inputs.
 
-    Key factors:
-    - Temperature inversion (surface temp < 850 hPa temp, or small lapse rate)
-    - High surface pressure (> 1020 mb) and rising trend
-    - High relative humidity (moisture gradient aids ducting)
-    - Low wind speed (stable atmosphere)
+    All inputs are expected in internal units (Fahrenheit, mb, mph).
+    Returns (score, factors_dict, inversion_detected) where score is
+    clamped to [0, 100].
     """
-    # Fetch current conditions + hourly pressure for trend + 850 hPa temp
-    url = (
-        f"https://api.open-meteo.com/v1/forecast?"
-        f"latitude={lat:.4f}&longitude={lon:.4f}"
-        f"&current=temperature_2m,relative_humidity_2m,pressure_msl,"
-        f"surface_pressure,wind_speed_10m"
-        f"&hourly=pressure_msl,temperature_850hPa"
-        f"&past_hours=6&forecast_hours=1"
-        f"&temperature_unit=fahrenheit"
-        f"&wind_speed_unit=mph"
-        f"&timezone=auto"
-    )
-    data = await _async_http_get(url, timeout=15)
-    if not data or "current" not in data:
-        return None
-
-    c = data["current"]
-    surface_temp_f = c.get("temperature_2m")
-    humidity = c.get("relative_humidity_2m")
-    pressure_msl = c.get("pressure_msl")
-    wind_speed = c.get("wind_speed_10m", 0)
-
-    # Extract 850 hPa temperature from hourly data (most recent value)
-    temp_850 = None
-    hourly = data.get("hourly", {})
-    temps_850 = hourly.get("temperature_850hPa", [])
-    if temps_850:
-        # Get the last non-null value
-        for t in reversed(temps_850):
-            if t is not None:
-                temp_850 = t
-                break
-
-    # Compute pressure trend from hourly MSL pressure (last 6 hours)
-    pressure_trend = None
-    pressures = hourly.get("pressure_msl", [])
-    if len(pressures) >= 3:
-        valid_pressures = [p for p in pressures if p is not None]
-        if len(valid_pressures) >= 2:
-            pressure_trend = valid_pressures[-1] - valid_pressures[0]
-
-    # ── Ducting index calculation ──────────────────────────────
     score = 0.0
-    factors = {}
+    factors: Dict[str, str] = {}
 
     # 1. Temperature inversion check (0-35 points)
-    # Normal lapse rate: surface should be warmer than 850 hPa
-    # If the difference is small or inverted, ducting is more likely
     inversion_detected = False
     if surface_temp_f is not None and temp_850 is not None:
-        # Convert both to same unit for comparison (both already Fahrenheit)
         lapse = surface_temp_f - temp_850
-        # Normal lapse: surface 20-40°F warmer than 850 hPa (~5000ft)
-        # Inversion: surface cooler than or close to 850 hPa
         if lapse < 0:
-            # True inversion
             score += 35
             inversion_detected = True
             factors["inversion"] = f"Strong inversion (lapse={lapse:.1f}°F)"
@@ -333,7 +403,6 @@ async def fetch_ducting_data(lat: float, lon: float) -> Optional[Dict[str, Any]]
             factors["inversion"] = f"Normal lapse rate ({lapse:.1f}°F)"
 
     # 2. Surface pressure (0-25 points)
-    # High pressure systems favor ducting
     if pressure_msl is not None:
         if pressure_msl >= 1030:
             score += 25
@@ -394,7 +463,68 @@ async def fetch_ducting_data(lat: float, lon: float) -> Optional[Dict[str, Any]]
         else:
             factors["wind"] = f"Strong ({wind_speed:.0f} mph)"
 
-    score = min(score, 100)
+    score = max(0.0, min(score, 100.0))
+    return score, factors, inversion_detected
+
+
+async def fetch_ducting_data(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    """Fetch atmospheric data and compute a VHF ducting probability index.
+
+    Uses Open-Meteo pressure-level API for temperature at 850 hPa and surface,
+    plus surface humidity and pressure trends. The ducting index (0-100) estimates
+    the likelihood of tropospheric ducting conditions.
+
+    Key factors:
+    - Temperature inversion (surface temp < 850 hPa temp, or small lapse rate)
+    - High surface pressure (> 1020 mb) and rising trend
+    - High relative humidity (moisture gradient aids ducting)
+    - Low wind speed (stable atmosphere)
+    """
+    # Fetch current conditions + hourly pressure for trend + 850 hPa temp
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat:.4f}&longitude={lon:.4f}"
+        f"&current=temperature_2m,relative_humidity_2m,pressure_msl,"
+        f"surface_pressure,wind_speed_10m"
+        f"&hourly=pressure_msl,temperature_850hPa"
+        f"&past_hours=6&forecast_hours=1"
+        f"&temperature_unit=fahrenheit"
+        f"&wind_speed_unit=mph"
+        f"&timezone=auto"
+    )
+    data = await _async_http_get(url, timeout=15)
+    if not data or "current" not in data:
+        return None
+
+    c = data["current"]
+    surface_temp_f = c.get("temperature_2m")
+    humidity = c.get("relative_humidity_2m")
+    pressure_msl = c.get("pressure_msl")
+    wind_speed = c.get("wind_speed_10m", 0)
+
+    # Extract 850 hPa temperature from hourly data (most recent value)
+    temp_850 = None
+    hourly = data.get("hourly", {})
+    temps_850 = hourly.get("temperature_850hPa", [])
+    if temps_850:
+        # Get the last non-null value
+        for t in reversed(temps_850):
+            if t is not None:
+                temp_850 = t
+                break
+
+    # Compute pressure trend from hourly MSL pressure (last 6 hours)
+    pressure_trend = None
+    pressures = hourly.get("pressure_msl", [])
+    if len(pressures) >= 3:
+        valid_pressures = [p for p in pressures if p is not None]
+        if len(valid_pressures) >= 2:
+            pressure_trend = valid_pressures[-1] - valid_pressures[0]
+
+    # ── Ducting index calculation ──────────────────────────────
+    score, factors, inversion_detected = _compute_ducting_score(
+        surface_temp_f, temp_850, pressure_msl, pressure_trend, humidity, wind_speed
+    )
 
     # Classify level
     if score >= 70:
@@ -419,6 +549,28 @@ async def fetch_ducting_data(lat: float, lon: float) -> Optional[Dict[str, Any]]
         "wind_speed_mph": wind_speed,
         "timestamp": time.time(),
     }
+
+
+# ── Ducting cache threshold decision ──────────────────────────────────
+
+def _should_refetch_ducting(
+    prev_pressure: Optional[float],
+    curr_pressure: Optional[float],
+    prev_temp: Optional[float],
+    curr_temp: Optional[float],
+) -> bool:
+    """Return True if a fresh ducting fetch should be triggered.
+
+    Thresholds: |pressure_diff| >= 2.0 mb OR |temp_diff| >= 3.0°F.
+    Also returns True if any previous value is None (first fetch or missing data).
+    """
+    if prev_pressure is None or prev_temp is None:
+        return True
+    if curr_pressure is None or curr_temp is None:
+        return True
+    pressure_diff = abs(curr_pressure - prev_pressure)
+    temp_diff = abs(curr_temp - prev_temp)
+    return pressure_diff >= 2.0 or temp_diff >= 3.0
 
 
 # ── NWS Severe Weather Alerts ────────────────────────────────────────
@@ -532,9 +684,12 @@ class WeatherManager:
         self._last_fetch: float = 0
         self._last_alert_fetch: float = 0
         self._last_ducting_fetch: float = 0
+        self._last_ducting_pressure: Optional[float] = None
+        self._last_ducting_temp: Optional[float] = None
         self._location_code_resolved: str = ""  # last code we resolved
         self._alert_scope_info: Optional[Dict[str, Any]] = None
         self._elevated_polling_until: float = 0
+        self._last_unit_system: Optional[UnitSystem] = None
 
     @property
     def is_configured(self) -> bool:
@@ -542,6 +697,34 @@ class WeatherManager:
             self.config.weather.enabled
             and self.config.weather.location_code
         )
+
+    @property
+    def effective_region(self) -> str:
+        """Determine the effective region from location and config.
+
+        Delegates to get_effective_region() using the resolved location
+        coordinates and the configured region setting.
+        """
+        lat = self._location["latitude"] if self._location else 0.0
+        lon = self._location["longitude"] if self._location else 0.0
+        configured_region = getattr(self.config.weather, "region", "auto")
+        return get_effective_region(lat, lon, configured_region)
+
+    @property
+    def effective_units(self) -> UnitSystem:
+        """Determine the effective unit system.
+
+        If config explicitly sets "imperial" or "metric", use that.
+        Otherwise auto-select metric for UK/EU and imperial for US.
+        """
+        configured_units = getattr(self.config.weather, "units", "imperial")
+        if configured_units in ("imperial", "metric"):
+            return get_unit_system(configured_units)
+        # Auto-select based on region
+        region = self.effective_region
+        if region in ("UK", "EU"):
+            return get_unit_system("metric")
+        return get_unit_system("imperial")
 
     async def resolve_and_set_location(self, code: str) -> Optional[Dict[str, Any]]:
         """Resolve a location code and cache the result."""
@@ -616,13 +799,22 @@ class WeatherManager:
         if not self._location:
             return None
 
+        # Determine current unit system and check for changes
+        current_unit_system = self.effective_units
+        if self._last_unit_system is not None and self._last_unit_system is not current_unit_system:
+            # Unit system changed — invalidate weather cache
+            self._current = None
+            self._last_fetch = 0
+
         refresh = self.config.weather.refresh_minutes * 60
         if not force and self._current and (time.time() - self._last_fetch < refresh):
             return self._current
 
+        unit_params = open_meteo_unit_params(current_unit_system)
         weather = await fetch_current_weather(
             self._location["latitude"],
             self._location["longitude"],
+            unit_params=unit_params,
         )
         if weather:
             weather["location_name"] = self._location.get("name", "")
@@ -630,13 +822,17 @@ class WeatherManager:
             weather["wind_direction_label"] = _wind_direction_label(
                 weather.get("wind_direction", 0) or 0
             )
+            # Apply unit formatting and add region
+            weather = format_weather_response(weather, current_unit_system)
+            weather["region"] = self.effective_region
             self._current = weather
             self._last_fetch = time.time()
+            self._last_unit_system = current_unit_system
 
         return self._current
 
     async def get_alerts(self, force: bool = False) -> List[Dict[str, Any]]:
-        """Get NWS alerts, fetching from API if cache is stale."""
+        """Get weather alerts, fetching from the region-appropriate provider if cache is stale."""
         if not self.is_configured or not self._location:
             return []
 
@@ -644,12 +840,13 @@ class WeatherManager:
         if not force and self._alerts is not None and (time.time() - self._last_alert_fetch < cache_seconds):
             return self._alerts
 
-        alerts = await fetch_nws_alerts(
+        provider = get_alert_provider(self.effective_region)
+        alerts = await provider.fetch_alerts(
             self._location["latitude"],
             self._location["longitude"],
-            self.config.weather.alert_range_miles,
-            self.config.weather.alert_scope_mode,
-            (self.config.weather.alert_scope_zone or "").strip().upper(),
+            range_miles=self.config.weather.alert_range_miles,
+            scope_mode=self.config.weather.alert_scope_mode,
+            scope_zone=(self.config.weather.alert_scope_zone or "").strip().upper(),
         )
         self._alerts = alerts
         self._last_alert_fetch = time.time()
@@ -658,13 +855,40 @@ class WeatherManager:
         return self._alerts
 
     async def get_ducting(self, force: bool = False) -> Optional[Dict[str, Any]]:
-        """Get ducting index data, fetching from API if cache is stale."""
+        """Get ducting index data, fetching from API if cache is stale.
+
+        Uses a two-level cache strategy:
+        1. Time-based: skip if less than 15 minutes since last fetch
+        2. Threshold-based: if time has elapsed, skip refetch when atmospheric
+           conditions haven't changed meaningfully (pressure Δ < 2.0 mb AND
+           temp Δ < 3.0°F)
+        """
         if not self.is_configured or not self._location:
             return None
 
         # Refresh ducting data every 15 minutes
-        if not force and self._ducting and (time.time() - self._last_ducting_fetch < 900):
+        time_elapsed = force or not self._ducting or (time.time() - self._last_ducting_fetch >= 900)
+
+        if not time_elapsed:
             return self._ducting
+
+        # Force bypasses threshold check
+        if not force and self._ducting is not None:
+            # Get current conditions for threshold comparison
+            current = await fetch_current_weather(
+                self._location["latitude"],
+                self._location["longitude"],
+            )
+            if current is not None:
+                curr_pressure = current.get("pressure_mb")
+                curr_temp = current.get("temperature_f")
+                if not _should_refetch_ducting(
+                    self._last_ducting_pressure, curr_pressure,
+                    self._last_ducting_temp, curr_temp,
+                ):
+                    # Thresholds not met — return cached data and reset timer
+                    self._last_ducting_fetch = time.time()
+                    return self._ducting
 
         ducting = await fetch_ducting_data(
             self._location["latitude"],
@@ -673,6 +897,9 @@ class WeatherManager:
         if ducting:
             self._ducting = ducting
             self._last_ducting_fetch = time.time()
+            # Store pressure and temperature for threshold comparison
+            self._last_ducting_pressure = ducting.get("pressure_mb")
+            self._last_ducting_temp = ducting.get("surface_temp_f")
 
         return self._ducting
 
@@ -693,6 +920,7 @@ class WeatherManager:
             "alert_count": len(alerts),
             "warning_count": sum(1 for a in alerts if a["alert_type"] == "warning"),
             "watch_count": sum(1 for a in alerts if a["alert_type"] == "watch"),
+            "region": self.effective_region,
             "alert_polling": {
                 "current_interval_seconds": self._get_alert_poll_interval_seconds(),
                 "elevated_active": self._elevated_polling_until > time.time(),

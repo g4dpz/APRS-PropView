@@ -1323,6 +1323,8 @@
 
             // Weather
             setChk('cfg-wx-enabled', cfg.weather?.enabled);
+            setVal('cfg-wx-region', cfg.weather?.region || 'auto');
+            setVal('cfg-wx-units', cfg.weather?.units || 'imperial');
             setVal('cfg-wx-location', cfg.weather?.location_code);
             setVal('cfg-wx-range', cfg.weather?.alert_range_miles);
             setVal('cfg-wx-refresh', cfg.weather?.refresh_minutes);
@@ -1448,6 +1450,8 @@
             },
             weather: {
                 enabled: getChk('cfg-wx-enabled'),
+                region: getVal('cfg-wx-region') || 'auto',
+                units: getVal('cfg-wx-units') || 'imperial',
                 location_code: getVal('cfg-wx-location'),
                 alert_range_miles: getVal('cfg-wx-range'),
                 refresh_minutes: getVal('cfg-wx-refresh'),

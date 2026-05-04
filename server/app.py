@@ -198,6 +198,19 @@ def _validate_config(body: Dict[str, Any]) -> Optional[str]:
         if dbpath and not _SAFE_PATH_RE.match(dbpath):
             return "Database path must be a simple filename (alphanumeric, dots, hyphens, underscores only)."
 
+    if "weather" in body:
+        wc = body["weather"]
+        region = wc.get("region")
+        if region is not None:
+            region = str(region).strip()
+            if region and region not in {"auto", "US", "UK", "EU"}:
+                return "Weather region must be one of: auto, US, UK, EU."
+        units = wc.get("units")
+        if units is not None:
+            units = str(units).strip()
+            if units and units not in {"imperial", "metric"}:
+                return "Weather units must be one of: imperial, metric."
+
     return None
 
 
@@ -886,6 +899,8 @@ def create_app(
             "weather": {
                 "enabled": config.weather.enabled,
                 "location_code": config.weather.location_code,
+                "region": config.weather.region,
+                "units": config.weather.units,
                 "alert_range_miles": config.weather.alert_range_miles,
                 "refresh_minutes": config.weather.refresh_minutes,
                 "radar_enabled": config.weather.radar_enabled,
@@ -1121,6 +1136,10 @@ def create_app(
                 wc = body["weather"]
                 config.weather.enabled = bool(wc.get("enabled", config.weather.enabled))
                 config.weather.location_code = (wc.get("location_code", config.weather.location_code) or "").strip()
+                region = (wc.get("region", config.weather.region) or "auto").strip()
+                config.weather.region = region if region in {"auto", "US", "UK", "EU"} else "auto"
+                units = (wc.get("units", config.weather.units) or "imperial").strip()
+                config.weather.units = units if units in {"imperial", "metric"} else "imperial"
                 config.weather.alert_range_miles = int(wc.get("alert_range_miles", config.weather.alert_range_miles))
                 config.weather.refresh_minutes = max(5, int(wc.get("refresh_minutes", config.weather.refresh_minutes)))
                 config.weather.radar_enabled = bool(wc.get("radar_enabled", config.weather.radar_enabled))
